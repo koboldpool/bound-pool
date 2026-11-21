@@ -1,0 +1,17 @@
+[Unit]
+Description=BOUND mainnet node (Kobold Pool, patched with getblocktemplate/submitblock)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=kobold
+Group=kobold
+ExecStart=/srv/kobold/coins/bound/bin/boundd --mainnet --datadir /srv/kobold/coins/bound/node node
+KillSignal=SIGTERM
+TimeoutStopSec=120
+Restart=always
+RestartSec=10
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

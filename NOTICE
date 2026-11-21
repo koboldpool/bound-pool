@@ -1,0 +1,8 @@
+bound-pool
+Copyright 2026 Kobold Pool. MIT License (see LICENSE).
+
+src/boundhash.rs is a port of BoundHash from the BOUND node (https://github.com/Sonic-Bound/Bound, v1.1.0,
+src/core/boundhash.cpp), and node/bound-pool-rpc.patch modifies that node's src/rpc/methods.cpp.
+BOUND is Copyright (c) 2026 BOUND, MIT License.
+
+Rust dependencies: sha2 (MIT or Apache-2.0), serde_json (MIT or Apache-2.0).

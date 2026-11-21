@@ -1,0 +1,72 @@
+# Builds and tests bound-pool on every push (Linux) and cross-builds the Windows miner; a tag v* also publishes
+# the binaries as a GitHub release.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container: rust:1.96-bookworm   # Debian 12: the Linux binaries need glibc 2.36 or later
+    steps:
+      - uses: actions/checkout@v4
+      - name: Windows target
+        run: |
+          apt-get update -qq && apt-get install -y -qq --no-install-recommends gcc-mingw-w64-x86-64 python3 >/dev/null
+          rustup target add x86_64-pc-windows-gnu
+      - name: Build (Linux)
+        run: cargo build --release --locked
+      - name: Tests
+        run: |
+          cargo test --release --locked
+          ./target/release/boundhash --vectors
+          python3 -m unittest -v test_payout
+      - name: Build the Windows miner
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+        run: cargo build --release --locked --target x86_64-pc-windows-gnu --bin bound-miner --bin boundhash
+      - name: Package
+        run: |
+          mkdir -p dist/bound-pool-linux-x86_64 dist/bound-miner-windows-x86_64
+          cp target/release/bound-pool target/release/bound-miner target/release/boundhash payout.py README.md LICENSE NOTICE \
+             dist/bound-pool-linux-x86_64/
+          cp target/x86_64-pc-windows-gnu/release/bound-miner.exe target/x86_64-pc-windows-gnu/release/boundhash.exe \
+             LICENSE NOTICE dist/bound-miner-windows-x86_64/
+          cd dist
+          tar --owner=0 --group=0 -czf bound-pool-linux-x86_64.tar.gz bound-pool-linux-x86_64
+          apt-get install -y -qq zip >/dev/null && zip -qr bound-miner-windows-x86_64.zip bound-miner-windows-x86_64
+          sha256sum bound-pool-linux-x86_64.tar.gz bound-miner-windows-x86_64.zip > SHA256SUMS
+          sha256sum bound-pool-linux-x86_64/* bound-miner-windows-x86_64/*.exe
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bound-pool-binaries
+          path: |
+            dist/bound-pool-linux-x86_64.tar.gz
+            dist/bound-miner-windows-x86_64.zip
+            dist/SHA256SUMS
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: bound-pool-binaries
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" bound-pool-linux-x86_64.tar.gz bound-miner-windows-x86_64.zip SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --title "bound-pool $GITHUB_REF_NAME" \
+            --notes "Built by GitHub Actions from commit $GITHUB_SHA (build log: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID). bound-miner for Windows is in the .zip, for Linux in the .tar.gz. Check the download with: sha256sum -c SHA256SUMS"

@@ -1,0 +1,32 @@
+[package]
+name = "bound-pool"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Kobold Pool's BOUND mining pool (protocol bound-pool/1), its CPU miner and a Rust BoundHash"
+repository = "https://github.com/koboldpool/bound-pool"
+
+[dependencies]
+sha2 = "0.10"
+serde_json = "1"
+
+[lib]
+name = "bound_pool"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bound-pool"
+path = "src/main.rs"
+
+[[bin]]
+name = "bound-miner"
+path = "src/bin/miner.rs"
+
+[[bin]]
+name = "boundhash"
+path = "src/bin/boundhash.rs"
+
+[profile.release]
+debug = false
+codegen-units = 1
+lto = true

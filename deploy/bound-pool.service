@@ -1,0 +1,17 @@
+[Unit]
+Description=BOUND pool (Kobold Pool, stratum 3480 PPLNS / 3490 solo)
+After=bound-node.service
+Requires=bound-node.service
+
+[Service]
+User=kobold
+Group=kobold
+WorkingDirectory=/srv/kobold/coins/bound
+# Replace POOL_ADDRESS with the address wallet-create.py printed.
+ExecStart=/srv/kobold/coins/bound/bin/bound-pool --network mainnet --address POOL_ADDRESS --cookie /srv/kobold/coins/bound/node/.cookie --data /srv/kobold/coins/bound/pool-data --listen 0.0.0.0:3480 --listen-solo 0.0.0.0:3490
+Restart=always
+RestartSec=10
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

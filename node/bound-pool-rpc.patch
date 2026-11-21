@@ -1,0 +1,215 @@
+diff --git a/src/rpc/methods.cpp b/src/rpc/methods.cpp
+index 4f9990d..84f7733 100644
+--- a/src/rpc/methods.cpp
++++ b/src/rpc/methods.cpp
+@@ -322,6 +322,34 @@ json transaction_to_json(const Transaction& tx, const ConsensusParams& params) {
+     return j;
+ }
+ 
++
++// Kobold Pool patch: names for submitblock's answer.
++static const char* accept_name(AcceptResult r) {
++    switch (r) {
++    case AcceptResult::Accepted: return "accepted";
++    case AcceptResult::Duplicate: return "duplicate";
++    case AcceptResult::BadProofOfWork: return "bad-proof-of-work";
++    case AcceptResult::UnknownParent: return "unknown-parent";
++    case AcceptResult::InvalidParent: return "invalid-parent";
++    case AcceptResult::BadDifficulty: return "bad-difficulty";
++    case AcceptResult::TimeTooOld: return "time-too-old";
++    case AcceptResult::TimeTooNew: return "time-too-new";
++    }
++    return "unknown";
++}
++
++static const char* connect_name(ConnectResult r) {
++    switch (r) {
++    case ConnectResult::Ok: return "ok";
++    case ConnectResult::BadBlock: return "bad-block";
++    case ConnectResult::BadCoinbaseHeight: return "bad-coinbase-height";
++    case ConnectResult::BadInputs: return "bad-inputs";
++    case ConnectResult::DuplicateOutput: return "duplicate-output";
++    case ConnectResult::CoinbaseTooLarge: return "coinbase-too-large";
++    }
++    return "unknown";
++}
++
+ void register_node_methods(RpcTable& t, NodeContext& node) {
+     const ConsensusParams& params = node.chain.params();
+     const std::size_t block_budget = params.max_block_size - 1000;  // what a block leaves for transactions
+@@ -706,6 +734,71 @@ void register_node_methods(RpcTable& t, NodeContext& node) {
+               return mining_info();
+           });
+ 
++    // Kobold Pool patch: work for a mining pool, and its solved blocks. The pool builds its own
++    // coinbase memo (the extra nonce) and merkle root from these, so miners get bare headers.
++    t.add("getblocktemplate", "<address>",
++          "Kobold Pool patch. A block to mine on the tip, paying the address, as the node's own miner would make it: "
++          "the 80-byte header (nonce 0) and the coinbase as hex (its memo, an 8-byte extra nonce of zeros, comes "
++          "last, so a pool can swap it for its own), and the other transactions with their wtxids.",
++          1, 1, [&node, block_budget](const RpcParams& p) -> json {
++              const ConsensusParams& params = node.chain.params();
++              const PublicKey payee = parse_address(p.str(0), params);
++              const auto now = static_cast<std::uint32_t>(node.clock());
++              std::optional<Block> tmpl = make_block_template(node.chain, payee, node.mempool.select(block_budget).txs, now);
++              if (!tmpl) tmpl = make_block_template(node.chain, payee, {}, now);
++              if (!tmpl) throw RpcError(rpc_error::kMisc, "can't make a block template");
++              const Block& b = *tmpl;
++              const BlockIndex& tip = node.chain.tip();
++              json txs = json::array();
++              for (std::size_t i = 1; i < b.txs.size(); ++i) {
++                  txs.push_back({{"data", to_hex(b.txs[i].serialize())},
++                                 {"txid", b.txs[i].txid().to_hex()},
++                                 {"wtxid", b.txs[i].wtxid().to_hex()}});
++              }
++              const std::optional<uint256> target = target_from_compact(b.header.bits);
++              const auto header = b.header.serialize();
++              return {
++                  {"height", tip.height + 1},
++                  {"previousblockhash", tip.hash.to_hex()},
++                  {"version", b.header.version},
++                  {"bits", std::format("{:08x}", b.header.bits)},
++                  {"target", target ? target->to_hex() : std::string()},
++                  {"curtime", b.header.time},
++                  {"mintime", tip.median_time_past(params.median_time_span) + 1},
++                  {"maxtime", now + params.max_future_block_time},
++                  {"coinbasevalue", b.txs[0].outputs.at(0).amount},
++                  {"pow_lines", params.pow_lines},
++                  {"header", to_hex(ByteSpan(header))},
++                  {"coinbase", to_hex(b.txs[0].serialize())},
++                  {"transactions", txs},
++                  {"initial_sync", node.peers.initial_sync(node.clock())},
++              };
++          });
++    t.add("submitblock", "<hex>",
++          "Kobold Pool patch. Offers a whole serialized block (from a pool or any miner): validated like a block from "
++          "a peer, and announced if it becomes the tip. Returns its hash, whether it was accepted, and why not.",
++          1, 1, [&node](const RpcParams& p) -> json {
++              const std::optional<Bytes> bytes = from_hex(p.str(0));
++              if (!bytes) throw RpcError(rpc_error::kDeserialization, "the block isn't hex");
++              Block block;
++              try {
++                  block = Block::deserialize(*bytes);
++              } catch (const DeserializeError& e) {
++                  throw RpcError(rpc_error::kDeserialization, std::string("can't decode the block: ") + e.what());
++              }
++              const BlockAcceptResult r = node.peers.submit_block(block, node.clock());
++              const uint256 hash = block.hash();
++              const BlockIndex* index = node.chain.find(hash);
++              return {
++                  {"hash", hash.to_hex()},
++                  {"accepted", r.accepted()},
++                  {"header", accept_name(r.header)},
++                  {"body", connect_name(r.body)},
++                  {"height", index != nullptr ? json(index->height) : json(nullptr)},
++                  {"tip", node.chain.tip().hash == hash},
++              };
++          });
++
+     // Utility.
+     t.add("validateaddress", "<address>", "Whether an address is valid on this network, and whether it's the wallet's.", 1, 1,
+           [&node](const RpcParams& p) -> json {
+diff --git a/tests/test_rpc.cpp b/tests/test_rpc.cpp
+index 72e3864..33926b8 100644
+--- a/tests/test_rpc.cpp
++++ b/tests/test_rpc.cpp
+@@ -1,5 +1,9 @@
+ #include "core/address.h"
+ #include "core/amount.h"
++#include "core/consensus.h"
++#include "core/merkle.h"
++#include "core/miner.h"
++#include "util/hex.h"
+ #include "net/addrman.h"
+ #include "net/peerman.h"
+ #include "rpc/http.h"
+@@ -574,4 +578,87 @@ TEST_F(NodeRpcTest, TransactionsShowTheirAddress) {
+     EXPECT_EQ(sent["category"], "send");
+     EXPECT_EQ(sent["address"], bob);  // not the change, which comes back to us
+     EXPECT_EQ(call("gettransaction", json::array({txid}))["address"], bob);
+-}
+\ No newline at end of file
++}
++
++// Kobold Pool patch: a pool's round trip. getblocktemplate's header and coinbase, the coinbase memo
++// swapped for the pool's own extra nonce, the merkle root recomputed, the nonce found, then the whole
++// block through submitblock; with and without a mempool transaction.
++TEST_F(NodeRpcTest, PoolTemplateAndSubmitBlock) {
++    const KeyPair alice = test_key("alice");
++    const std::string pool_addr = encode_address(test_key("pool").public_key(), params.address_version);
++    EXPECT_EQ(error_code("getblocktemplate", {"nonsense"}), rpc_error::kInvalidAddressOrKey);
++    EXPECT_EQ(error_code("submitblock", {"zz"}), rpc_error::kDeserialization);
++    EXPECT_EQ(error_code("submitblock", {"00"}), rpc_error::kDeserialization);
++
++    // Builds and mines the block a pool would, from a template, with `memo` as the extra nonce.
++    const auto pool_block = [&](const json& tmpl, const std::string& memo) {
++        Bytes coinbase = from_hex(tmpl["coinbase"].get<std::string>()).value();
++        EXPECT_EQ(coinbase.back(), 0);
++        EXPECT_EQ(coinbase[coinbase.size() - 9], 8);  // var_bytes: an 8-byte memo, last
++        coinbase.resize(coinbase.size() - 9);
++        coinbase.push_back(static_cast<std::uint8_t>(memo.size()));
++        coinbase.insert(coinbase.end(), memo.begin(), memo.end());
++        Block block;
++        block.header = BlockHeader::deserialize(from_hex(tmpl["header"].get<std::string>()).value());
++        block.txs.push_back(Transaction::deserialize(coinbase));
++        for (const json& tx : tmpl["transactions"]) block.txs.push_back(Transaction::deserialize(from_hex(tx["data"].get<std::string>()).value()));
++        std::vector<uint256> leaves;
++        for (const Transaction& tx : block.txs) leaves.push_back(tx.wtxid());
++        block.header.merkle_root = merkle_root(leaves);
++        block.header = mine(block.header, params).value();
++        return block;
++    };
++
++    json tmpl = call("getblocktemplate", {pool_addr});
++    EXPECT_EQ(tmpl["height"], 1);
++    EXPECT_EQ(tmpl["previousblockhash"], chain.tip().hash.to_hex());
++    EXPECT_EQ(tmpl["coinbasevalue"], block_subsidy(1, params));
++    EXPECT_EQ(tmpl["pow_lines"], params.pow_lines);
++    EXPECT_EQ(tmpl["bits"], "207fffff");
++    EXPECT_TRUE(tmpl["transactions"].empty());
++    EXPECT_EQ(tmpl["initial_sync"], false);
++    Block block = pool_block(tmpl, "KoboldPool-s1-0001");
++    json r = call("submitblock", {to_hex(block.serialize())});
++    EXPECT_EQ(r["accepted"], true);
++    EXPECT_EQ(r["tip"], true);
++    EXPECT_EQ(r["height"], 1);
++    EXPECT_EQ(r["hash"], block.hash().to_hex());
++    EXPECT_EQ(chain.tip().hash, block.hash());
++    EXPECT_EQ(chain.block_at(1).txs[0].outputs[0].recipient, test_key("pool").public_key());
++    r = call("submitblock", {to_hex(block.serialize())});  // again
++    EXPECT_EQ(r["accepted"], false);
++    EXPECT_EQ(r["header"], "duplicate");
++
++    // A block whose coinbase pays more than allowed is refused, with the reason.
++    tmpl = call("getblocktemplate", {pool_addr});
++    Transaction greedy = Transaction::deserialize(from_hex(tmpl["coinbase"].get<std::string>()).value());
++    greedy.outputs[0].amount += 1;
++    json bad = tmpl;
++    bad["coinbase"] = to_hex(greedy.serialize());
++    r = call("submitblock", {to_hex(pool_block(bad, "x").serialize())});
++    EXPECT_EQ(r["accepted"], false);
++    EXPECT_EQ(r["body"], "coinbase-too-large");
++    EXPECT_EQ(chain.height(), 1);
++
++    // With a transaction waiting: alice's mature coinbase, spent to bob.
++    const std::string alice_addr = encode_address(alice.public_key(), params.address_version);
++    call("generatetoaddress", {101, alice_addr});
++    const Transaction coinbase = chain.block_at(2).txs[0];
++    ASSERT_EQ(coinbase.outputs[0].recipient, alice.public_key());
++    Transaction pay;
++    pay.inputs.push_back(OutPoint{coinbase.txid(), 0});
++    pay.outputs.push_back(TxOut{coinbase.outputs[0].amount - 1000, test_key("bob").public_key()});
++    sign_all_inputs(pay, alice);
++    call("sendrawtransaction", {to_hex(pay.serialize())});
++    tmpl = call("getblocktemplate", {pool_addr});
++    ASSERT_EQ(tmpl["transactions"].size(), 1u);
++    EXPECT_EQ(tmpl["transactions"][0]["txid"], pay.txid().to_hex());
++    EXPECT_EQ(tmpl["transactions"][0]["wtxid"], pay.wtxid().to_hex());
++    EXPECT_EQ(tmpl["coinbasevalue"], block_subsidy(chain.height() + 1, params) + 1000);
++    block = pool_block(tmpl, "KoboldPool-s2-0002");
++    r = call("submitblock", {to_hex(block.serialize())});
++    EXPECT_EQ(r["accepted"], true);
++    EXPECT_EQ(r["tip"], true);
++    EXPECT_EQ(mempool.size(), 0u);
++    EXPECT_EQ(chain.tip().hash, block.hash());
++}
