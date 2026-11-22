@@ -6,6 +6,7 @@ use bound_pool::boundhash::{BoundHasher, valid_lines};
 use bound_pool::chain::{address_version, block_id, compact_size, decode_address, merkle_root, wtxid};
 use bound_pool::common::*;
 use bound_pool::rpc::Rpc;
+use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -20,6 +21,22 @@ use std::time::{Duration, Instant};
 const MAX_LINE: usize = 16_384;
 /// Jobs a session keeps for late submits.
 const KEEP_JOBS: usize = 16;
+
+/// What the pool signs for a locked miner: the domain, the miner's challenge, then the job as sent.
+fn lock_message(challenge: &[u8; 32], job_id: &str, header: &[u8; 80], target: &[u8; 32]) -> Vec<u8> {
+    let mut m = b"kobold-pool-lock/1".to_vec();
+    m.extend_from_slice(challenge);
+    m.extend_from_slice(header);
+    m.extend_from_slice(target);
+    m.extend_from_slice(job_id.as_bytes());
+    m
+}
+
+fn lock_key(path: &std::path::Path) -> Result<SigningKey, String> {
+    let b = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let seed: [u8; 32] = b.as_slice().try_into().map_err(|_| format!("{}: not 32 bytes", path.display()))?;
+    Ok(SigningKey::from_bytes(&seed))
+}
 /// Pool share target = 2^(256-k) - 1 (about 2^k hashes per share), never harder than the block's.
 const K_MIN: u32 = 4;
 const K_MAX: u32 = 60;
@@ -50,6 +67,8 @@ struct Config {
     max_tip_age: u64,
     /// No work with fewer peers than this (default 1 on mainnet, 0 elsewhere): never mine a private fork.
     min_peers: usize,
+    /// 32-byte Ed25519 seed: with it, every job to a miner that sent a lock challenge is signed (pool lock).
+    lock_key: PathBuf,
 }
 
 fn config() -> Config {
@@ -66,6 +85,7 @@ fn config() -> Config {
         tag: "KoboldPool".into(),
         max_tip_age: 86_400,
         min_peers: usize::MAX, // set below from the network
+        lock_key: PathBuf::new(),
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -84,11 +104,18 @@ fn config() -> Config {
             "--tag" => c.tag = v,
             "--max-tip-age" => c.max_tip_age = v.parse().expect("--max-tip-age seconds"),
             "--min-peers" => c.min_peers = v.parse().expect("--min-peers N"),
+            "--lock-key" => c.lock_key = v.into(),
+            "--lock-pubkey" => {
+                let key = lock_key(std::path::Path::new(&v)).expect("--lock-pubkey <key file>");
+                println!("{}", hex(key.verifying_key().as_bytes()));
+                std::process::exit(0);
+            }
             "--help" | "-h" => {
                 println!(
                     "bound-pool --address <pool wallet address> --cookie <boundd datadir>/.cookie [--network mainnet|testnet|regtest] \
                      [--rpc 127.0.0.1:7332] [--listen 0.0.0.0:3480] [--listen-solo 0.0.0.0:3490] [--data pool-data] [--start-k 16] \
-                     [--name bound-pool] [--tag KoboldPool] [--max-tip-age 86400] [--min-peers 1 on mainnet, else 0]"
+                     [--name bound-pool] [--tag KoboldPool] [--max-tip-age 86400] [--min-peers 1 on mainnet, else 0] [--lock-key <file>]
+                     bound-pool --lock-pubkey <file>   prints the public key of a lock key"
                 );
                 std::process::exit(0);
             }
@@ -230,6 +257,7 @@ struct Shared {
     /// The parent of the pool's last block that became the tip: jobs on it are stale at once, before
     /// the node loop has fetched the next template (else shares in that gap became orphan blocks).
     solved_parent: Mutex<Option<[u8; 32]>>,
+    lock_key: Option<SigningKey>,
     /// Fees in basis points (100 = 1 %), from <data>/pool-config.json, re-read every 10 s.
     fee_bp: AtomicU32,
     solo_fee_bp: AtomicU32,
@@ -273,6 +301,8 @@ struct SessState {
     window_count: usize,
     second: (Instant, usize),
     bad_in_a_row: u32,
+    /// The miner's lock challenge from mining.subscribe: its jobs carry the pool's signature over it.
+    lock: Option<[u8; 32]>,
 }
 
 struct Session {
@@ -321,10 +351,13 @@ fn push_job(sh: &Shared, sess: &Session, tmpl: &Arc<Template>, clean: bool) {
         let mut leaves = vec![wtxid(&job.coinbase())];
         leaves.extend_from_slice(&tmpl.wtxids);
         job.header[36..68].copy_from_slice(&merkle_root(&leaves));
-        let msg = json!([{
+        let mut msg = json!([{
             "job_id": job.id, "clean": clean, "header": hex(&job.header), "target": to_display(&job.target),
             "height": tmpl.height, "lines": tmpl.lines, "bits": format!("{:08x}", tmpl.bits)
         }]);
+        if let (Some(key), Some(ch)) = (&sh.lock_key, &st.lock) {
+            msg[0]["sig"] = json!(hex(&key.sign(&lock_message(ch, &job.id, &job.header, &job.target)).to_bytes()));
+        }
         st.jobs.push_back(job);
         while st.jobs.len() > KEEP_JOBS {
             st.jobs.pop_front();
@@ -468,6 +501,7 @@ fn serve_miner(sh: Arc<Shared>, stream: TcpStream, solo_port: bool) {
             window_count: 0,
             second: (Instant::now(), 0),
             bad_in_a_row: 0,
+            lock: None,
         }),
     });
     sh.sessions.lock().unwrap().push(sess.clone());
@@ -489,7 +523,7 @@ fn serve_miner(sh: Arc<Shared>, stream: TcpStream, solo_port: bool) {
         let p = req.get("params").and_then(|v| v.as_array()).cloned().unwrap_or_default();
         let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let reply = match method {
-            "mining.subscribe" => subscribe(&sh, &sess, &rid),
+            "mining.subscribe" => subscribe(&sh, &sess, &rid, &p),
             "mining.authorize" => authorize(&sh, &sess, &rid, &p),
             "mining.submit" => submit(&sh, &sess, &rid, &p, &mut hasher),
             "mining.suggest_difficulty" | "mining.suggest_target" | "mining.extranonce.subscribe" => ok(&rid, json!(true)),
@@ -514,12 +548,13 @@ fn serve_miner(sh: Arc<Shared>, stream: TcpStream, solo_port: bool) {
     sh.log(&format!("session {} {} closed ({})", sess.id, sess.peer, logins));
 }
 
-fn subscribe(sh: &Shared, sess: &Session, rid: &Value) -> Value {
+fn subscribe(sh: &Shared, sess: &Session, rid: &Value, p: &[Value]) -> Value {
     if sh.current().is_none() {
         return err(rid, 20, "pool has no work from its node yet");
     }
     let mut st = sess.st.lock().unwrap();
     st.subscribed = true;
+    st.lock = p.get(1).and_then(|o| o.get("lock")).and_then(|v| v.as_str()).and_then(unhex32);
     ok(rid, json!({"session": format!("{:x}", sess.id), "extranonce1": hex(&st.en1), "protocol": "bound-pool/1",
                    "network": sh.cfg.network}))
 }
@@ -842,6 +877,7 @@ fn main() {
         peers: AtomicUsize::new(0),
         refresh_now: AtomicBool::new(false),
         solved_parent: Mutex::new(None),
+        lock_key: (!cfg.lock_key.as_os_str().is_empty()).then(|| lock_key(&cfg.lock_key).expect("--lock-key")),
         fee_bp: AtomicU32::new(0),
         solo_fee_bp: AtomicU32::new(0),
         round_work: Mutex::new(0.0),
