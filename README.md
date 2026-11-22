@@ -23,6 +23,14 @@ bound-miner -o bound.koboldpool.com:3480 -u YOUR_BOUND_ADDRESS.rig1 -t 8
 
 Port 3480 is PPLNS, 3490 solo. `-t` is the number of CPU threads. A wallet: the official BOUND release (`bound-qt`).
 
+**GPU miners** that speak Miningcore-style stratum, such as BoundCuda: port **3481** (PPLNS) or **3491** (solo).
+
+```
+boundcuda.exe --device 0 -o bound.koboldpool.com:3481 -u YOUR_BOUND_ADDRESS.gpu1 -p x
+```
+
+Shares on 3481/3491 count exactly like those on 3480/3490: the same address has one balance.
+
 ## How shares and payouts work
 
 - **Work.** The pool asks its node for a block template and gives every connection its own block header (the coinbase

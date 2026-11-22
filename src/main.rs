@@ -5,6 +5,7 @@
 use bound_pool::boundhash::{BoundHasher, valid_lines};
 use bound_pool::chain::{address_version, block_id, compact_size, decode_address, merkle_root, wtxid};
 use bound_pool::common::*;
+use bound_pool::mcstratum as mc;
 use bound_pool::rpc::Rpc;
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{Value, json};
@@ -55,6 +56,9 @@ struct Config {
     listen: String,
     /// Every login on this port mines solo.
     listen_solo: String,
+    /// The Miningcore-style dialect (BoundCuda and similar GPU miners): PPLNS and solo ports ("off": none).
+    listen_mc: String,
+    listen_mc_solo: String,
     rpc: String,
     cookie: PathBuf,
     /// The pool wallet's address: every block's coinbase pays it.
@@ -76,6 +80,8 @@ fn config() -> Config {
         network: "mainnet".into(),
         listen: "0.0.0.0:3480".into(),
         listen_solo: "0.0.0.0:3490".into(),
+        listen_mc: "0.0.0.0:3481".into(),
+        listen_mc_solo: "0.0.0.0:3491".into(),
         rpc: String::new(),
         cookie: PathBuf::new(),
         address: String::new(),
@@ -95,6 +101,8 @@ fn config() -> Config {
             "--network" => c.network = v,
             "--listen" => c.listen = v,
             "--listen-solo" => c.listen_solo = v,
+            "--listen-mc" => c.listen_mc = v,
+            "--listen-mc-solo" => c.listen_mc_solo = v,
             "--rpc" => c.rpc = v,
             "--cookie" => c.cookie = v.into(),
             "--address" => c.address = v,
@@ -113,7 +121,7 @@ fn config() -> Config {
             "--help" | "-h" => {
                 println!(
                     "bound-pool --address <pool wallet address> --cookie <boundd datadir>/.cookie [--network mainnet|testnet|regtest] \
-                     [--rpc 127.0.0.1:7332] [--listen 0.0.0.0:3480] [--listen-solo 0.0.0.0:3490] [--data pool-data] [--start-k 16] \
+                     [--rpc 127.0.0.1:7332] [--listen 0.0.0.0:3480] [--listen-solo 0.0.0.0:3490]                      [--listen-mc 0.0.0.0:3481|off] [--listen-mc-solo 0.0.0.0:3491|off] [--data pool-data] [--start-k 16] \
                      [--name bound-pool] [--tag KoboldPool] [--max-tip-age 86400] [--min-peers 1 on mainnet, else 0] [--lock-key <file>]
                      bound-pool --lock-pubkey <file>   prints the public key of a lock key"
                 );
@@ -231,6 +239,26 @@ impl Job {
     }
 }
 
+/// A job of the Miningcore-style dialect: one per template, shared by its sessions (each adds its own
+/// extraNonce1, and the miner its extraNonce2).
+struct McJob {
+    id: String,
+    tmpl: Arc<Template>,
+    work: mc::McWork,
+}
+
+impl McJob {
+    fn block(&self, header: &[u8; 80], coinbase: &[u8]) -> Vec<u8> {
+        let mut b = header.to_vec();
+        compact_size(1 + self.tmpl.txs.len() as u64, &mut b);
+        b.extend_from_slice(coinbase);
+        for t in &self.tmpl.txs {
+            b.extend_from_slice(t);
+        }
+        b
+    }
+}
+
 #[derive(Default)]
 struct Counters {
     accepted: AtomicU64,
@@ -245,6 +273,7 @@ struct Shared {
     version: &'static [u8],
     rpc: Rpc,
     tmpl: Mutex<Option<Arc<Template>>>,
+    mc_jobs: Mutex<VecDeque<Arc<McJob>>>,
     sessions: Mutex<Vec<Arc<Session>>>,
     /// Recent accepted shares for the hash rate: (time, address, worker, work, solo).
     recent: Mutex<VecDeque<(Instant, String, String, f64, bool)>>,
@@ -303,12 +332,19 @@ struct SessState {
     bad_in_a_row: u32,
     /// The miner's lock challenge from mining.subscribe: its jobs carry the pool's signature over it.
     lock: Option<[u8; 32]>,
+    /// Miningcore-style dialect: the k of the last set_difficulty, the one before it (accepted for 30 s
+    /// after a change) and the shares seen (job, extraNonce2, ntime, nonce).
+    mc_k: Option<u32>,
+    mc_prev: Option<(u32, Instant)>,
+    mc_seen: HashSet<(String, [u8; 4], u32, u32)>,
 }
 
 struct Session {
     id: u64,
     peer: String,
     solo_port: bool,
+    /// Speaks the Miningcore-style dialect (ports 3481/3491), not bound-pool/1.
+    mc: bool,
     out: Mutex<TcpStream>,
     st: Mutex<SessState>,
     alive: AtomicBool,
@@ -331,6 +367,10 @@ impl Session {
 
 /// Makes the session a new job on `tmpl` (its own memo, merkle root and header) and sends it.
 fn push_job(sh: &Shared, sess: &Session, tmpl: &Arc<Template>, clean: bool) {
+    if sess.mc {
+        push_job_mc(sh, sess, tmpl, clean);
+        return;
+    }
     let counter = sh.next_job.fetch_add(1, Ordering::Relaxed);
     let msg = {
         let mut st = sess.st.lock().unwrap();
@@ -477,7 +517,7 @@ fn valid_login(version: &[u8], login: &str) -> Option<(String, String)> {
     Some((addr.to_string(), if worker.is_empty() { "default".into() } else { worker.to_string() }))
 }
 
-fn serve_miner(sh: Arc<Shared>, stream: TcpStream, solo_port: bool) {
+fn serve_miner(sh: Arc<Shared>, stream: TcpStream, solo_port: bool, mc_dialect: bool) {
     let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(600)));
@@ -488,6 +528,7 @@ fn serve_miner(sh: Arc<Shared>, stream: TcpStream, solo_port: bool) {
         id,
         peer: peer.clone(),
         solo_port,
+        mc: mc_dialect,
         out: Mutex::new(out),
         alive: AtomicBool::new(true),
         st: Mutex::new(SessState {
@@ -502,6 +543,9 @@ fn serve_miner(sh: Arc<Shared>, stream: TcpStream, solo_port: bool) {
             second: (Instant::now(), 0),
             bad_in_a_row: 0,
             lock: None,
+            mc_k: None,
+            mc_prev: None,
+            mc_seen: HashSet::new(),
         }),
     });
     sh.sessions.lock().unwrap().push(sess.clone());
@@ -523,8 +567,10 @@ fn serve_miner(sh: Arc<Shared>, stream: TcpStream, solo_port: bool) {
         let p = req.get("params").and_then(|v| v.as_array()).cloned().unwrap_or_default();
         let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let reply = match method {
+            "mining.subscribe" if sess.mc => subscribe_mc(&sh, &sess, &rid),
             "mining.subscribe" => subscribe(&sh, &sess, &rid, &p),
             "mining.authorize" => authorize(&sh, &sess, &rid, &p),
+            "mining.submit" if sess.mc => submit_mc(&sh, &sess, &rid, &p, &mut hasher),
             "mining.submit" => submit(&sh, &sess, &rid, &p, &mut hasher),
             "mining.suggest_difficulty" | "mining.suggest_target" | "mining.extranonce.subscribe" => ok(&rid, json!(true)),
             _ => err(&rid, 20, "unknown method"),
@@ -646,9 +692,169 @@ fn submit(sh: &Arc<Shared>, sess: &Session, rid: &Value, p: &[Value], hasher: &m
         return err(rid, 23, "hash above the share target");
     }
     let block = meets(&hash, &tmpl.target);
-    let work = work_of(&target);
+    let raw = if block {
+        let st = sess.st.lock().unwrap();
+        st.jobs.iter().find(|j| j.id == job_id).map(|j| j.block(&header))
+    } else {
+        None
+    };
+    credit(sh, &login, solo, &tmpl, &header, &hash, &target, block, raw);
+    vardiff(sh, sess);
+    ok(rid, json!(true))
+}
+
+// ------------------------------------------------------------------------------------- Miningcore-style dialect
+
+/// The shared job for `tmpl`, made once per template.
+fn mc_job(sh: &Shared, tmpl: &Arc<Template>) -> Arc<McJob> {
+    let mut jobs = sh.mc_jobs.lock().unwrap();
+    if let Some(j) = jobs.back().filter(|j| Arc::ptr_eq(&j.tmpl, tmpl)) {
+        return j.clone();
+    }
+    let id = format!("{:x}", sh.next_job.fetch_add(1, Ordering::Relaxed));
+    let work = mc::build_work(&tmpl.coinbase_prefix, sh.cfg.tag.as_bytes(), &tmpl.header, &tmpl.wtxids);
+    let j = Arc::new(McJob { id, tmpl: tmpl.clone(), work });
+    jobs.push_back(j.clone());
+    while jobs.len() > KEEP_JOBS {
+        jobs.pop_front();
+    }
+    j
+}
+
+/// The k a session of this dialect mines at: its vardiff k, inside the range BoundCuda's difficulty can
+/// express exactly, and never a share target harder than the block's.
+fn mc_k(k: u32, tmpl: &Template) -> u32 {
+    let mut k = k.clamp(mc::K_MIN, mc::K_MAX);
+    while k > mc::K_MIN && !meets(&tmpl.target, &mc::target_from_diff(mc::diff_of_k(k))) {
+        k -= 1;
+    }
+    k
+}
+
+/// set_difficulty (when it changed), then the shared job.
+fn push_job_mc(sh: &Shared, sess: &Session, tmpl: &Arc<Template>, clean: bool) {
+    let job = mc_job(sh, tmpl);
+    let new_k = {
+        let mut st = sess.st.lock().unwrap();
+        if st.logins.is_empty() {
+            return;
+        }
+        if clean {
+            st.mc_seen.clear();
+        }
+        let k = mc_k(st.k, tmpl);
+        if st.mc_k == Some(k) {
+            None
+        } else {
+            st.mc_prev = st.mc_k.map(|old| (old, Instant::now()));
+            st.mc_k = Some(k);
+            Some(k)
+        }
+    };
+    if let Some(k) = new_k {
+        sess.notify("mining.set_difficulty", json!([mc::diff_of_k(k)]));
+    }
+    sess.notify("mining.notify", mc::notify_params(&job.id, &job.work, clean));
+}
+
+fn subscribe_mc(sh: &Shared, sess: &Session, rid: &Value) -> Value {
+    if sh.current().is_none() {
+        return err(rid, 20, "pool has no work from its node yet");
+    }
+    let mut st = sess.st.lock().unwrap();
+    st.subscribed = true;
+    let sid = format!("{:x}", sess.id);
+    ok(rid, json!([[["mining.set_difficulty", sid], ["mining.notify", sid]], hex(&st.en1), mc::EN2_SIZE]))
+}
+
+/// mining.submit [login, job_id, extraNonce2, ntime, nonce], each 8 hex digits.
+fn submit_mc(sh: &Arc<Shared>, sess: &Session, rid: &Value, p: &[Value], hasher: &mut Option<BoundHasher>) -> Value {
+    let s = |i: usize| p.get(i).and_then(|v| v.as_str()).unwrap_or("");
+    let login = s(0).to_string();
+    let job_id = s(1).to_string();
+    let (Some(en2), Some(ntime), Some(nonce)) = (mc::parse_en2(s(2)), mc::parse_hex32(s(3)), mc::parse_hex32(s(4))) else {
+        return err(rid, 20, "bad params: [login, job_id, extranonce2, ntime, nonce]");
+    };
+    let current = sh.current();
+    let solved = *sh.solved_parent.lock().unwrap();
+    let job = sh.mc_jobs.lock().unwrap().iter().rev().find(|j| j.id == job_id).cloned();
+    let (header, coinbase, targets, job, solo) = {
+        let mut st = sess.st.lock().unwrap();
+        if !st.subscribed {
+            return err(rid, 25, "not subscribed");
+        }
+        if !st.logins.contains(&login) {
+            return err(rid, 24, "login not authorized");
+        }
+        let now_i = Instant::now();
+        if now_i.duration_since(st.second.0) >= Duration::from_secs(1) {
+            st.second = (now_i, 0);
+        }
+        st.second.1 += 1;
+        if st.second.1 > MAX_SUBMITS_PER_SEC {
+            sess.alive.store(false, Ordering::Relaxed);
+            return err(rid, 20, "too many submits");
+        }
+        let solo = st.solo.contains(&login);
+        let Some(job) = job else { return err(rid, 21, "job not found") };
+        if current.as_ref().is_none_or(|c| c.prev != job.tmpl.prev) || solved == Some(job.tmpl.prev) {
+            sh.counters.stale.fetch_add(1, Ordering::Relaxed);
+            return err(rid, 21, "stale job: the chain has a new block");
+        }
+        // The node takes times after the median time past and up to 2 h ahead; keep a margin.
+        if (ntime as u64) < job.tmpl.mintime || ntime as u64 > now() + 3600 {
+            return err(rid, 20, "ntime out of range");
+        }
+        if !st.mc_seen.insert((job_id.clone(), en2, ntime, nonce)) {
+            return err(rid, 22, "duplicate share");
+        }
+        let Some(k) = st.mc_k else { return err(rid, 21, "job not found") };
+        let mut targets = vec![mc::target_from_diff(mc::diff_of_k(k))];
+        if let Some((old, _)) = st.mc_prev.filter(|(_, at)| at.elapsed() < Duration::from_secs(30)) {
+            targets.push(mc::target_from_diff(mc::diff_of_k(old)));
+        }
+        let en1 = st.en1;
+        let header = mc::header(&job.work, &en1, &en2, ntime, nonce);
+        (header, mc::coinbase(&job.work, &en1, &en2), targets, job, solo)
+    };
+    if hasher.as_ref().is_none_or(|h| h.lines() != job.tmpl.lines) {
+        *hasher = Some(BoundHasher::new(job.tmpl.lines));
+    }
+    let hash = hasher.as_mut().unwrap().hash(&header);
+    // The current difficulty, or the previous one within 30 s of a change (the miner may still be on it).
+    let Some(target) = targets.into_iter().find(|t| meets(&hash, t)) else {
+        sh.counters.rejected.fetch_add(1, Ordering::Relaxed);
+        let mut st = sess.st.lock().unwrap();
+        st.bad_in_a_row += 1;
+        if st.bad_in_a_row > MAX_BAD_IN_A_ROW {
+            sess.alive.store(false, Ordering::Relaxed);
+        }
+        return err(rid, 23, "low difficulty share");
+    };
+    let block = meets(&hash, &job.tmpl.target);
+    let raw = block.then(|| job.block(&header, &coinbase));
+    credit(sh, &login, solo, &job.tmpl, &header, &hash, &target, block, raw);
+    vardiff(sh, sess);
+    ok(rid, json!(true))
+}
+
+/// Counts an accepted share (both dialects alike: shares.jsonl, hash rate, effort) and, if it meets the block
+/// target, sends `raw` (the whole block) to the node and records the found/result events.
+#[allow(clippy::too_many_arguments)]
+fn credit(
+    sh: &Arc<Shared>,
+    login: &str,
+    solo: bool,
+    tmpl: &Template,
+    header: &[u8; 80],
+    hash: &[u8; 32],
+    target: &[u8; 32],
+    block: bool,
+    raw: Option<Vec<u8>>,
+) {
+    let work = work_of(target);
     let block_work = work_of(&tmpl.target);
-    let (addr, worker) = valid_login(sh.version, &login).unwrap_or_default();
+    let (addr, worker) = valid_login(sh.version, login).unwrap_or_default();
     sh.counters.accepted.fetch_add(1, Ordering::Relaxed);
     let mode = if solo { "solo" } else { "pplns" };
     sh.record(0, json!({"ts": now(), "addr": addr, "worker": worker, "work": work, "height": tmpl.height,
@@ -664,11 +870,7 @@ fn submit(sh: &Arc<Shared>, sess: &Session, rid: &Value, p: &[Value], hasher: &m
         e
     };
     if block {
-        let raw = {
-            let st = sess.st.lock().unwrap();
-            st.jobs.iter().find(|j| j.id == job_id).map(|j| j.block(&header))
-        };
-        let mut id = block_id(&header);
+        let mut id = block_id(header);
         id.reverse();
         let id = hex(&id);
         sh.counters.blocks_submitted.fetch_add(1, Ordering::Relaxed);
@@ -677,7 +879,7 @@ fn submit(sh: &Arc<Shared>, sess: &Session, rid: &Value, p: &[Value], hasher: &m
         prev.reverse();
         sh.record(1, json!({"ts": now(), "event": "found", "height": tmpl.height, "id": id, "parent": hex(&prev),
                             "finder": login, "sent": raw.is_some(), "block_work": block_work, "mode": mode,
-                            "effort": effort, "hash": to_display(&hash),
+                            "effort": effort, "hash": to_display(hash),
                             "fee_bp": if solo { sh.solo_fee_bp.load(Ordering::Relaxed) } else { sh.fee_bp.load(Ordering::Relaxed) }}));
         if let Some(raw) = raw {
             let (accepted, tip, reason) = match sh.rpc.call("submitblock", json!([hex(&raw)])) {
@@ -706,8 +908,6 @@ fn submit(sh: &Arc<Shared>, sess: &Session, rid: &Value, p: &[Value], hasher: &m
             sh.refresh_now.store(true, Ordering::Relaxed);
         }
     }
-    vardiff(sh, sess);
-    ok(rid, json!(true))
 }
 
 fn vardiff(sh: &Shared, sess: &Session) {
@@ -868,6 +1068,7 @@ fn main() {
         version,
         rpc,
         tmpl: Mutex::new(None),
+        mc_jobs: Mutex::new(VecDeque::new()),
         sessions: Mutex::new(Vec::new()),
         recent: Mutex::new(VecDeque::new()),
         next_session: AtomicU64::new(1),
@@ -903,22 +1104,27 @@ fn main() {
         let s = sh.clone();
         thread::spawn(move || stats_loop(s));
     }
-    let accept = |addr: String, solo: bool, sh: Arc<Shared>| {
+    let accept = |addr: String, solo: bool, mc_dialect: bool, sh: Arc<Shared>| {
         let listener = TcpListener::bind(&addr).unwrap_or_else(|e| panic!("listen {addr}: {e}"));
-        sh.log(&format!("stratum (bound-pool/1) listening on {addr} ({})", if solo { "solo" } else { "PPLNS" }));
+        let dialect = if mc_dialect { "Miningcore-style stratum" } else { "stratum (bound-pool/1)" };
+        sh.log(&format!("{dialect} listening on {addr} ({})", if solo { "solo" } else { "PPLNS" }));
         for conn in listener.incoming() {
             match conn {
                 Ok(s) => {
                     let sh2 = sh.clone();
-                    thread::spawn(move || serve_miner(sh2, s, solo));
+                    thread::spawn(move || serve_miner(sh2, s, solo, mc_dialect));
                 }
                 Err(e) => sh.log(&format!("accept failed: {e}")),
             }
         }
     };
+    for (addr, solo, mc_dialect) in
+        [(sh.cfg.listen_solo.clone(), true, false), (sh.cfg.listen_mc.clone(), false, true), (sh.cfg.listen_mc_solo.clone(), true, true)]
     {
-        let (sh2, addr) = (sh.clone(), sh.cfg.listen_solo.clone());
-        thread::spawn(move || accept(addr, true, sh2));
+        if addr != "off" {
+            let sh2 = sh.clone();
+            thread::spawn(move || accept(addr, solo, mc_dialect, sh2));
+        }
     }
-    accept(sh.cfg.listen.clone(), false, sh.clone());
+    accept(sh.cfg.listen.clone(), false, false, sh.clone());
 }
