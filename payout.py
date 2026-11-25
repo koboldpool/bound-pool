@@ -16,6 +16,13 @@ import urllib.request
 from decimal import Decimal
 from pathlib import Path
 
+# Shared ledger helper (lock, dated copy, fsync'd saves, pending-before-send), loaded by path so it also works
+# under python3 -I (which leaves the script's folder off sys.path).
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location("kobold_ledger", Path(__file__).resolve().parent / "kobold_ledger.py")
+kl = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(kl)
+
 COINBASE_MATURITY = 100
 COIN = 100_000_000           # base units per BOUND
 # ConsensusParams per network (src/core/params.cpp): (initial subsidy, halving interval, RPC port).
@@ -117,13 +124,12 @@ def main() -> int:
 
     data = Path(args.data)
     ledger_path = data / "payouts.json"
-    ledger = json.loads(ledger_path.read_text()) if ledger_path.exists() else {
-        "credited": {}, "orphaned": {}, "balances": {}, "paid": {}, "payments": [], "pool_fees": 0}
+    led = kl.Ledger(ledger_path)  # lock + dated copy before the run
+    ledger = led.open({
+        "credited": {}, "orphaned": {}, "balances": {}, "paid": {}, "payments": [], "pool_fees": 0})
 
     def save():
-        tmp = ledger_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(ledger, indent=1))
-        tmp.replace(ledger_path)
+        led.save(ledger)  # temp file, fsync, rename, fsync the folder
 
     tip = int(rpc(args, "getblockcount"))
     reconcile(args, ledger, tip)
@@ -188,6 +194,9 @@ def main() -> int:
           f"{sum(ledger['balances'].values()) / COIN:.8f} BOUND")
     for a, b in sorted(ledger["balances"].items(), key=lambda kv: -kv[1]):
         print(f"  {a}  {b / COIN:.8f} BOUND{'  (due)' if a in due else ''}")
+    if args.pay and kl.hold(ledger, ledger_path):
+        save()
+        return kl.HOLD_EXIT
     if not args.pay or not due:
         save()
         return 0
@@ -214,9 +223,17 @@ def main() -> int:
                 break
             text = f"{amount / COIN:.8f}"
             params = [addr, text] + ([args.fee_rate] if args.fee_rate is not None else [])
+            # Pending before send: recorded and saved first, so a crash after the send cannot pay twice.
+            intent = kl.new_intent()
+            kl.add_intent(ledger, intent, addr, amount, height_sent=tip)
+            save()
             try:
                 txid = rpc(args, "sendtoaddress", *params)
-            except RuntimeError as e:
+            except Exception as e:  # noqa: BLE001
+                if not kl.refused(e):
+                    raise  # no answer: it may have gone out; stays 'sending', the next run holds
+                kl.drop_intent(ledger, intent)
+                save()
                 print(f"payment to {addr} failed: {e}")
                 break
             fee = 0
@@ -224,10 +241,7 @@ def main() -> int:
                 fee = abs(units(rpc(args, "gettransaction", txid).get("fee", "0")))
             except RuntimeError:
                 pass
-            ledger["balances"][addr] -= amount
-            ledger["paid"][addr] = ledger["paid"].get(addr, 0) + amount
-            ledger["payments"].append({"ts": int(time.time()), "addr": addr, "amount": amount, "txid": txid,
-                                       "fee": fee, "status": "pending", "height_sent": int(rpc(args, "getblockcount"))})
+            kl.mark_sent(ledger, intent, txid, fee=fee, height_sent=int(rpc(args, "getblockcount")))
             available -= amount + fee
             save()
             print(f"paid {text} BOUND to {addr}: {txid} (fee {fee / COIN:.8f})")

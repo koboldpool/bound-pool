@@ -9,6 +9,7 @@ miners can check how their shares are counted and paid.
 | `bound-miner` | CPU miner for the pool (Windows and Linux) |
 | `bound-pool` | the pool server: stratum `bound-pool/1` (PPLNS port and solo port), work from a patched BOUND node, every share re-hashed |
 | `payout.py` | PPLNS payouts with the node's own wallet; tracks every payment until it is deep in the chain |
+| `kobold_ledger.py` | crash-safe ledger for `payout.py` (keep it next to it): a lock, durable saves, dated copies, and each payment saved before it is sent, so a crash can't pay twice |
 | `boundhash` | BoundHash from the command line: test vectors, single hashes, a benchmark |
 | `node/bound-pool-rpc.patch` | adds `getblocktemplate` and `submitblock` to the BOUND node's RPC (it has neither) |
 
