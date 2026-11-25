@@ -293,7 +293,7 @@ struct Shared {
     /// Share work since the pool's last block: effort = round work / block work.
     round_work: Mutex<f64>,
     counters: Counters,
-    files: Mutex<(File, File, File)>, // shares.jsonl, blocks.jsonl, pool.log
+    files: Mutex<(File, File, File, File)>, // shares.jsonl, blocks.jsonl, pool.log, rejects.jsonl
     started: u64,
 }
 
@@ -308,7 +308,11 @@ impl Shared {
 
     fn record(&self, which: usize, v: Value) {
         if let Ok(mut f) = self.files.lock() {
-            let file = if which == 0 { &mut f.0 } else { &mut f.1 };
+            let file = match which {
+                0 => &mut f.0,
+                1 => &mut f.1,
+                _ => &mut f.3, // REJECTS
+            };
             let _ = writeln!(file, "{v}");
         }
     }
@@ -496,6 +500,19 @@ fn install(sh: &Arc<Shared>, t: Template, clean: bool) {
 
 // ------------------------------------------------------------------------------------- miners
 
+/// Which file `Shared::record` writes to: one line per refused share, for our monitoring only (the site never reads it).
+const REJECTS: usize = 2;
+
+/// A refused submit (any error answer) as one line in rejects.jsonl.
+fn log_reject(sh: &Shared, sess: &Session, p: &[Value], reply: &Value) {
+    let Some(e) = reply.get("error").filter(|e| !e.is_null()) else { return };
+    let who = p.first().and_then(|v| v.as_str()).unwrap_or("");
+    let (addr, worker) = who.split_once('.').unwrap_or((who, ""));
+    let reason = e.get(1).and_then(|v| v.as_str()).unwrap_or("");
+    sh.record(REJECTS, json!({"ts": now(), "addr": addr, "worker": worker, "ip": sess.peer,
+        "reason": reason, "stale": reason.contains("stale")}));
+}
+
 fn err(id: &Value, code: u32, msg: &str) -> Value {
     json!({"id": id, "result": null, "error": [code, msg]})
 }
@@ -570,8 +587,16 @@ fn serve_miner(sh: Arc<Shared>, stream: TcpStream, solo_port: bool, mc_dialect: 
             "mining.subscribe" if sess.mc => subscribe_mc(&sh, &sess, &rid),
             "mining.subscribe" => subscribe(&sh, &sess, &rid, &p),
             "mining.authorize" => authorize(&sh, &sess, &rid, &p),
-            "mining.submit" if sess.mc => submit_mc(&sh, &sess, &rid, &p, &mut hasher),
-            "mining.submit" => submit(&sh, &sess, &rid, &p, &mut hasher),
+            "mining.submit" if sess.mc => {
+                let r = submit_mc(&sh, &sess, &rid, &p, &mut hasher);
+                log_reject(&sh, &sess, &p, &r);
+                r
+            }
+            "mining.submit" => {
+                let r = submit(&sh, &sess, &rid, &p, &mut hasher);
+                log_reject(&sh, &sess, &p, &r);
+                r
+            }
             "mining.suggest_difficulty" | "mining.suggest_target" | "mining.extranonce.subscribe" => ok(&rid, json!(true)),
             _ => err(&rid, 20, "unknown method"),
         };
@@ -1076,7 +1101,7 @@ fn main() {
     assert!(!cfg.cookie.as_os_str().is_empty(), "--cookie <boundd datadir>/.cookie is required");
     std::fs::create_dir_all(&cfg.data).expect("create the data directory");
     let open = |n: &str| OpenOptions::new().create(true).append(true).open(cfg.data.join(n)).expect("open log file");
-    let files = (open("shares.jsonl"), open("blocks.jsonl"), open("pool.log"));
+    let files = (open("shares.jsonl"), open("blocks.jsonl"), open("pool.log"), open("rejects.jsonl"));
     let rpc = Rpc { addr: cfg.rpc.clone(), cookie: cfg.cookie.clone(), timeout: Duration::from_secs(30) };
     let seed = u32::from_le_bytes(block_id(&[now() as u8; 80])[..4].try_into().unwrap()) ^ (now() as u32) ^ std::process::id();
     let sh = Arc::new(Shared {
